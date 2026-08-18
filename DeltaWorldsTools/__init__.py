@@ -10,7 +10,7 @@
 bl_info = {
     "name": "DeltaWorlds Tools (1.0 Alpha)",
     "author": "Custom for DeltaWorlds / ActiveWorlds CAV avatars",
-    "version": (1, 0, 1),
+    "version": (1, 0, 5),
     "blender": (4, 2, 0),
     "location": "File > Export > DeltaWorlds DirectX (.x)  |  N-Panel > DeltaWorlds",
     "description": "Import FBX, rename bones, convert textures, and export DirectX .x for DeltaWorlds / ActiveWorlds (Ultimate Unwrap style). Works on Blender 4.2+",
@@ -88,7 +88,7 @@ class DW_AddonPreferences(bpy.types.AddonPreferences):
             col = box.column()
             col.label(text="Made By OCM =)")
             col.label(text="Tested on Blender 4.2 and 5.1")
-            col.label(text="Version 1.0 Alpha")
+            col.label(text="Version 1.0.5 Alpha")
 
 
 def _update_tex_prefix(self, context):
@@ -580,6 +580,16 @@ class DW_PT_bone_panel(bpy.types.Panel):
             if not _fbx_importer_available():
                 box.label(text="Enable FBX addon in Preferences", icon="ERROR")
             box.operator("deltaworlds.fix_missing_textures", text="Fix Missing Textures", icon="IMAGE_DATA")
+            box.operator(
+                "deltaworlds.fix_avatarsdk_mesh",
+                text="Join Meshes",
+                icon="MOD_DATA_TRANSFER",
+            )
+            box.operator(
+                "deltaworlds.fix_origin",
+                text="Fix Origin",
+                icon="OBJECT_ORIGIN",
+            )
             box.operator("deltaworlds.scan_bones", text="Scan Armature", icon="ARMATURE_DATA")
             row = box.row(align=True)
             row.label(text="Scale Face Bones:")
@@ -1855,8 +1865,220 @@ class DW_OT_apply_preferences(bpy.types.Operator):
         return {"FINISHED"}
 
 
+
+class DW_OT_fix_avatarsdk_mesh(bpy.types.Operator):
+    bl_idname = "deltaworlds.fix_avatarsdk_mesh"
+    bl_label = "Join Meshes"
+    bl_description = (
+        "Join all meshes skinned/parented to the armature into one object. "
+        "Renames UV maps to UVMap so textures stay correct. "
+        "Some avatars (e.g. AvatarSDK) ship as many loose meshes and need this before export "
+        "or DeltaWorlds may not animate them. Keep total vertices under 65,535."
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import export_x
+
+        arm = _get_armature(context)
+        if not arm:
+            self.report({"ERROR"}, "No armature found — pick one in the dropdown")
+            return {"CANCELLED"}
+
+        meshes = export_x.find_skinned_meshes(arm, only_selected=False)
+        # Also include meshes parented to the armature even without modifier
+        seen = {m.name for m in meshes}
+        for obj in context.scene.objects:
+            if obj.type != "MESH" or obj.name in seen:
+                continue
+            if obj.parent == arm:
+                meshes.append(obj)
+                seen.add(obj.name)
+
+        if not meshes:
+            self.report({"ERROR"}, "No meshes found skinned/parented to the armature")
+            return {"CANCELLED"}
+
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        # --- Pass 1: unify UV map names so Join merges layers correctly ---
+        uv_fixed = 0
+        for obj in meshes:
+            me = obj.data
+            if not me.uv_layers:
+                continue
+            # Keep the active (or first) layer; remove extras so one layer remains
+            active = me.uv_layers.active
+            if active is None:
+                active = me.uv_layers[0]
+            for uv in list(me.uv_layers):
+                if uv.name != active.name:
+                    me.uv_layers.remove(uv)
+            if me.uv_layers:
+                me.uv_layers[0].name = "UVMap"
+                uv_fixed += 1
+
+        # --- Pass 2: ensure every used material is on the mesh datablock ---
+        for obj in meshes:
+            me = obj.data
+            # Object-linked materials → mesh so they survive join
+            for i, slot in enumerate(obj.material_slots):
+                if slot.material is None:
+                    continue
+                # Ensure mesh has a slot for this material
+                if slot.link == "OBJECT":
+                    # Copy link to data if possible
+                    try:
+                        slot.link = "DATA"
+                    except Exception:
+                        pass
+                if slot.material.name not in [m.name for m in me.materials if m]:
+                    me.materials.append(slot.material)
+
+        if len(meshes) == 1:
+            self.report(
+                {"INFO"},
+                f"Only one mesh ({meshes[0].name}) — UV maps fixed, nothing to join",
+            )
+            return {"FINISHED"}
+
+        # --- Pass 3: join all into one mesh ---
+        bpy.ops.object.select_all(action="DESELECT")
+        for obj in meshes:
+            obj.hide_set(False)
+            obj.hide_viewport = False
+            obj.select_set(True)
+        # Active = largest mesh (usually main body) so names/materials prefer it
+        meshes_sorted = sorted(meshes, key=lambda o: len(o.data.vertices), reverse=True)
+        target = meshes_sorted[0]
+        context.view_layer.objects.active = target
+
+        before_name = target.name
+        bpy.ops.object.join()
+
+        joined = context.view_layer.objects.active
+        if joined is None or joined.type != "MESH":
+            self.report({"ERROR"}, "Join failed")
+            return {"CANCELLED"}
+
+        # Ensure Armature modifier points at our armature
+        has_arm_mod = False
+        for mod in joined.modifiers:
+            if mod.type == "ARMATURE":
+                mod.object = arm
+                has_arm_mod = True
+        if not has_arm_mod:
+            mod = joined.modifiers.new(name="Armature", type="ARMATURE")
+            mod.object = arm
+
+        # Parent to armature if not already
+        if joined.parent != arm:
+            joined.parent = arm
+            joined.matrix_parent_inverse = arm.matrix_world.inverted()
+
+        n_mats = len([m for m in joined.data.materials if m])
+        n_uv = len(joined.data.uv_layers)
+        self.report(
+            {"INFO"},
+            f"Joined {len(meshes)} meshes → '{joined.name}' "
+            f"({len(joined.data.vertices)} verts, {n_mats} materials, {n_uv} UV layer(s)); "
+            f"UV fixed on {uv_fixed} mesh(es)",
+        )
+        return {"FINISHED"}
+
+
+
+
+
+class DW_OT_fix_origin(bpy.types.Operator):
+    bl_idname = "deltaworlds.fix_origin"
+    bl_label = "Fix Origin"
+    bl_description = (
+        "Move the armature origin and all skinned mesh origins to the pelvis bone's "
+        "rest position (center of the body). Classic DeltaWorlds avatars use a centered "
+        "origin; Mixamo/FBX often leave the origin at the feet, which exaggerates root motion"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from mathutils import Vector
+        from . import export_x
+
+        arm = _get_armature(context)
+        if not arm:
+            self.report({"ERROR"}, "No armature found")
+            return {"CANCELLED"}
+
+        # Find pelvis bone (rest head = rotation pivot)
+        pelvis_names = (
+            "aw_pelvis", "pelvis", "Hips", "mixamorig:Hips", "mixamorig_Hips",
+            "Bip01 Pelvis", "Bip01_Pelvis", "hip",
+        )
+        bone = None
+        for n in pelvis_names:
+            bone = arm.data.bones.get(n)
+            if bone:
+                break
+        if bone is None:
+            for b in arm.data.bones:
+                ln = b.name.lower()
+                if "pelvis" in ln or ln in ("hips", "hip"):
+                    bone = b
+                    break
+        if bone is None:
+            self.report({"ERROR"}, "Could not find pelvis / Hips bone")
+            return {"CANCELLED"}
+
+        # World-space rest head of pelvis
+        pelvis_world = arm.matrix_world @ bone.head_local.copy()
+
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        # Remember cursor, then use origin-to-cursor (safe for mesh + armature)
+        prev_cursor = context.scene.cursor.location.copy()
+        context.scene.cursor.location = pelvis_world
+
+        meshes = export_x.find_skinned_meshes(arm, only_selected=False)
+        seen = {m.name for m in meshes}
+        for obj in context.scene.objects:
+            if obj.type == "MESH" and obj.name not in seen and obj.parent == arm:
+                meshes.append(obj)
+                seen.add(obj.name)
+
+        targets = [arm] + list(meshes)
+        moved = []
+        for obj in targets:
+            bpy.ops.object.select_all(action="DESELECT")
+            obj.hide_set(False)
+            obj.hide_viewport = False
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+            try:
+                bpy.ops.object.origin_set(type="ORIGIN_CURSOR", center="MEDIAN")
+                moved.append(obj.name)
+            except Exception as e:
+                self.report({"WARNING"}, f"Origin failed on {obj.name}: {e}")
+
+        context.scene.cursor.location = prev_cursor
+        bpy.ops.object.select_all(action="DESELECT")
+        arm.select_set(True)
+        context.view_layer.objects.active = arm
+
+        self.report(
+            {"INFO"},
+            f"Origin set to pelvis '{bone.name}' at "
+            f"({pelvis_world.x:.3f}, {pelvis_world.y:.3f}, {pelvis_world.z:.3f}) "
+            f"for {len(moved)} object(s)",
+        )
+        return {"FINISHED"}
+
+
 classes = (
     DW_AddonPreferences,
+    DW_OT_fix_origin,
+    DW_OT_fix_avatarsdk_mesh,
     DW_OT_apply_preferences,
     DW_OT_step_tex_size,
     DW_OT_step_tex_max_kb,

@@ -7,7 +7,7 @@ import bpy
 from mathutils import Matrix, Vector
 from pathlib import Path
 
-EXPORTER_VERSION = "1.0.1 Alpha"
+EXPORTER_VERSION = "1.0.5 Alpha"
 
 
 def mat4_to_x(m, indent=0):
